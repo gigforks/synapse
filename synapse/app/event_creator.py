@@ -38,7 +38,10 @@ from synapse.replication.slave.storage.receipts import SlavedReceiptsStore
 from synapse.replication.slave.storage.registration import SlavedRegistrationStore
 from synapse.replication.slave.storage.room import RoomStore
 from synapse.replication.tcp.client import ReplicationClientHandler
-from synapse.rest.client.v1.room import RoomSendEventRestServlet
+from synapse.rest.client.v1.room import (
+    RoomSendEventRestServlet, RoomMembershipRestServlet, RoomStateEventRestServlet,
+    JoinRoomAliasServlet,
+)
 from synapse.server import HomeServer
 from synapse.storage.engines import create_engine
 from synapse.util.httpresourcetree import create_resource_tree
@@ -85,6 +88,9 @@ class EventCreatorServer(HomeServer):
                 elif name == "client":
                     resource = JsonResource(self, canonical_json=False)
                     RoomSendEventRestServlet(self).register(resource)
+                    RoomMembershipRestServlet(self).register(resource)
+                    RoomStateEventRestServlet(self).register(resource)
+                    JoinRoomAliasServlet(self).register(resource)
                     resources.update({
                         "/_matrix/client/r0": resource,
                         "/_matrix/client/unstable": resource,
