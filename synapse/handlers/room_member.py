@@ -30,6 +30,7 @@ from synapse.api.errors import AuthError, SynapseError, Codes
 from synapse.types import UserID, RoomID
 from synapse.util.async import Linearizer
 from synapse.util.distributor import user_left_room, user_joined_room
+from synapse.replication.http.membership import remote_join, remote_leave
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,8 @@ class RoomMemberHandler(object):
         self.distributor = hs.get_distributor()
         self.distributor.declare("user_joined_room")
         self.distributor.declare("user_left_room")
+
+        self.http_client = hs.get_simple_http_client()
 
     @defer.inlineCallbacks
     def _local_membership_update(
@@ -138,9 +141,22 @@ class RoomMemberHandler(object):
         defer.returnValue(event)
 
     @defer.inlineCallbacks
-    def _remote_join(self, remote_room_hosts, room_id, user, content):
+    def _remote_join(self, requester, remote_room_hosts, room_id, user, content):
         if len(remote_room_hosts) == 0:
             raise SynapseError(404, "No known servers")
+
+        if self.config.worker_app:
+            ret = yield remote_join(
+                self.http_client,
+                host=self.config.worker_replication_host,
+                port=self.config.worker_replication_http_port,
+                requester=requester,
+                remote_room_hosts=remote_room_hosts,
+                room_id=room_id,
+                user_id=user.to_string(),
+                content=content,
+            )
+            defer.returnValue(ret)
 
         # We don't do an auth check if we are doing an invite
         # join dance for now, since we're kinda implicitly checking
@@ -155,7 +171,19 @@ class RoomMemberHandler(object):
         yield user_joined_room(self.distributor, user, room_id)
 
     @defer.inlineCallbacks
-    def _remote_leave(self, remote_room_hosts, room_id, target):
+    def _remote_leave(self, requester, remote_room_hosts, room_id, target):
+        if self.config.worker_app:
+            ret = yield remote_leave(
+                self.http_client,
+                host=self.config.worker_replication_host,
+                port=self.config.worker_replication_http_port,
+                requester=requester,
+                remote_room_hosts=remote_room_hosts,
+                room_id=room_id,
+                user_id=target.to_string(),
+            )
+            defer.returnValue(ret)
+
         fed_handler = self.federation_handler
         try:
             ret = yield fed_handler.do_remotely_reject_invite(
@@ -331,7 +359,7 @@ class RoomMemberHandler(object):
                     content["kind"] = "guest"
 
                 ret = yield self._remote_join(
-                    remote_room_hosts, room_id, target, content
+                    requester, remote_room_hosts, room_id, target, content
                 )
                 defer.returnValue(ret)
 
@@ -352,7 +380,9 @@ class RoomMemberHandler(object):
                 else:
                     # send the rejection to the inviter's HS.
                     remote_room_hosts = remote_room_hosts + [inviter.domain]
-                    res = yield self._remote_leave(remote_room_hosts, room_id, target)
+                    res = yield self._remote_leave(
+                        requester, remote_room_hosts, room_id, target,
+                    )
                     defer.returnValue(res)
 
         res = yield self._local_membership_update(
