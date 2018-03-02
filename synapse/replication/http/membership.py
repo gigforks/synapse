@@ -70,6 +70,28 @@ def remote_leave(client, host, port, requester, remote_room_hosts,
     defer.returnValue(result)
 
 
+@defer.inlineCallbacks
+def get_or_register_3pid_guest(client, host, port, requester,
+                               medium, address, inviter_user_id):
+    uri = "http://%s:%s/_synapse/replication/get_or_register_3pid_guest" % (host, port)
+
+    payload = {
+        "requester": requester.serialize(),
+        "medium": medium,
+        "address": address,
+        "inviter_user_id": inviter_user_id,
+    }
+
+    try:
+        result = yield client.post_json_get_json(uri, payload)
+    except MatrixCodeMessageException as e:
+        # We convert to SynapseError as we know that it was a SynapseError
+        # on the master process that we should send to the client. (And
+        # importantly, not stack traces everywhere)
+        raise SynapseError(e.code, e.msg, e.errcode)
+    defer.returnValue(result)
+
+
 class ReplicationRemoteJoinRestServlet(RestServlet):
     PATTERNS = [re.compile("^/_synapse/replication/remote_join$")]
 
@@ -161,6 +183,39 @@ class ReplicationRemoteLeaveRestServlet(RestServlet):
         defer.returnValue((200, ret))
 
 
+class ReplicationRegister3PIDGuestRestServlet(RestServlet):
+    PATTERNS = [re.compile("^/_synapse/replication/get_or_register_3pid_guest$")]
+
+    def __init__(self, hs):
+        super(ReplicationRegister3PIDGuestRestServlet, self).__init__()
+
+        self.registeration_handler = hs.get_handlers().registration_handler
+        self.store = hs.get_datastore()
+        self.clock = hs.get_clock()
+
+    @defer.inlineCallbacks
+    def on_POST(self, request):
+        content = parse_json_object_from_request(request)
+
+        medium = content["medium"]
+        address = content["address"]
+        inviter_user_id = content["inviter_user_id"]
+
+        requester = Requester.deserialize(self.store, content["requester"])
+
+        if requester.user:
+            request.authenticated_entity = requester.user.to_string()
+
+        logger.info("get_or_register_3pid_guest: %r", content)
+
+        ret = yield self.registeration_handler.get_or_register_3pid_guest(
+            medium, address, inviter_user_id,
+        )
+
+        defer.returnValue((200, ret))
+
+
 def register_servlets(hs, http_server):
     ReplicationRemoteJoinRestServlet(hs).register(http_server)
     ReplicationRemoteLeaveRestServlet(hs).register(http_server)
+    ReplicationRegister3PIDGuestRestServlet(hs).register(http_server)

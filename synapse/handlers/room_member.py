@@ -14,9 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import logging
-
 from signedjson.key import decode_verify_key_bytes
 from signedjson.sign import verify_signed_json
 from twisted.internet import defer
@@ -30,7 +27,14 @@ from synapse.api.errors import AuthError, SynapseError, Codes
 from synapse.types import UserID, RoomID
 from synapse.util.async import Linearizer
 from synapse.util.distributor import user_left_room, user_joined_room
-from synapse.replication.http.membership import remote_join, remote_leave
+from synapse.replication.http.membership import (
+    remote_join, remote_leave, get_or_register_3pid_guest,
+)
+
+
+import abc
+import logging
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,8 @@ class RoomMemberHandler(object):
     #   low-level API that works on UserID objects and so on, and REST-level
     #   API that takes ID strings and returns pagination chunks. These concerns
     #   ought to be separated out a lot better.
+
+    __metaclass__ = abc.ABCMeta
 
     def __init__(self, hs):
         self.hs = hs
@@ -68,6 +74,18 @@ class RoomMemberHandler(object):
         self.distributor.declare("user_left_room")
 
         self.http_client = hs.get_simple_http_client()
+
+    @abc.abstractmethod
+    def _remote_join(self, requester, remote_room_hosts, room_id, user, content):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def _remote_leave(self, requester, remote_room_hosts, room_id, target):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_or_register_3pid_guest(self, requester, medium, address, inviter_user_id):
+        raise NotImplementedError()
 
     @defer.inlineCallbacks
     def _local_membership_update(
@@ -139,72 +157,6 @@ class RoomMemberHandler(object):
                     user_left_room(self.distributor, target, room_id)
 
         defer.returnValue(event)
-
-    @defer.inlineCallbacks
-    def _remote_join(self, requester, remote_room_hosts, room_id, user, content):
-        if len(remote_room_hosts) == 0:
-            raise SynapseError(404, "No known servers")
-
-        if self.config.worker_app:
-            ret = yield remote_join(
-                self.http_client,
-                host=self.config.worker_replication_host,
-                port=self.config.worker_replication_http_port,
-                requester=requester,
-                remote_room_hosts=remote_room_hosts,
-                room_id=room_id,
-                user_id=user.to_string(),
-                content=content,
-            )
-            defer.returnValue(ret)
-
-        # We don't do an auth check if we are doing an invite
-        # join dance for now, since we're kinda implicitly checking
-        # that we are allowed to join when we decide whether or not we
-        # need to do the invite/join dance.
-        yield self.federation_handler.do_invite_join(
-            remote_room_hosts,
-            room_id,
-            user.to_string(),
-            content,
-        )
-        yield user_joined_room(self.distributor, user, room_id)
-
-    @defer.inlineCallbacks
-    def _remote_leave(self, requester, remote_room_hosts, room_id, target):
-        if self.config.worker_app:
-            ret = yield remote_leave(
-                self.http_client,
-                host=self.config.worker_replication_host,
-                port=self.config.worker_replication_http_port,
-                requester=requester,
-                remote_room_hosts=remote_room_hosts,
-                room_id=room_id,
-                user_id=target.to_string(),
-            )
-            defer.returnValue(ret)
-
-        fed_handler = self.federation_handler
-        try:
-            ret = yield fed_handler.do_remotely_reject_invite(
-                remote_room_hosts,
-                room_id,
-                target.to_string(),
-            )
-            defer.returnValue(ret)
-        except Exception as e:
-            # if we were unable to reject the exception, just mark
-            # it as rejected on our end and plough ahead.
-            #
-            # The 'except' clause is very broad, but we need to
-            # capture everything from DNS failures upwards
-            #
-            logger.warn("Failed to reject invite: %s", e)
-
-            yield self.store.locally_reject_invite(
-                target.to_string(), room_id
-            )
-            defer.returnValue({})
 
     @defer.inlineCallbacks
     def update_membership(
@@ -675,6 +627,7 @@ class RoomMemberHandler(object):
 
         token, public_keys, fallback_public_key, display_name = (
             yield self._ask_id_server_for_third_party_invite(
+                requester=requester,
                 id_server=id_server,
                 medium=medium,
                 address=address,
@@ -711,6 +664,7 @@ class RoomMemberHandler(object):
     @defer.inlineCallbacks
     def _ask_id_server_for_third_party_invite(
             self,
+            requester,
             id_server,
             medium,
             address,
@@ -727,6 +681,7 @@ class RoomMemberHandler(object):
         Asks an identity server for a third party invite.
 
         Args:
+            requester (Requester)
             id_server (str): hostname + optional port for the identity server.
             medium (str): The literal string "email".
             address (str): The third party address being invited.
@@ -769,20 +724,16 @@ class RoomMemberHandler(object):
         }
 
         if self.config.invite_3pid_guest:
-            registration_handler = self.registration_handler
-            guest_access_token = yield registration_handler.guest_access_token_for(
+            guest_access_token, guest_user_id = yield self.get_or_register_3pid_guest(
+                requester=requester,
                 medium=medium,
                 address=address,
                 inviter_user_id=inviter_user_id,
             )
 
-            guest_user_info = yield self.auth.get_user_by_access_token(
-                guest_access_token
-            )
-
             invite_config.update({
                 "guest_access_token": guest_access_token,
-                "guest_user_id": guest_user_info["user"].to_string(),
+                "guest_user_id": guest_user_id,
             })
 
         data = yield self.simple_http_client.post_urlencoded_get_json(
@@ -808,27 +759,6 @@ class RoomMemberHandler(object):
         defer.returnValue((token, public_keys, fallback_public_key, display_name))
 
     @defer.inlineCallbacks
-    def forget(self, user, room_id):
-        user_id = user.to_string()
-
-        member = yield self.state_handler.get_current_state(
-            room_id=room_id,
-            event_type=EventTypes.Member,
-            state_key=user_id
-        )
-        membership = member.membership if member else None
-
-        if membership is not None and membership not in [
-            Membership.LEAVE, Membership.BAN
-        ]:
-            raise SynapseError(400, "User %s in room %s" % (
-                user_id, room_id
-            ))
-
-        if membership:
-            yield self.store.forget(user_id, room_id)
-
-    @defer.inlineCallbacks
     def _is_host_in_room(self, current_state_ids):
         # Have we just created the room, and is this about to be the very
         # first member event?
@@ -849,3 +779,117 @@ class RoomMemberHandler(object):
                 defer.returnValue(True)
 
         defer.returnValue(False)
+
+
+class RoomMemberMasterHandler(RoomMemberHandler):
+    @defer.inlineCallbacks
+    def _remote_join(self, requester, remote_room_hosts, room_id, user, content):
+        if len(remote_room_hosts) == 0:
+            raise SynapseError(404, "No known servers")
+
+        # We don't do an auth check if we are doing an invite
+        # join dance for now, since we're kinda implicitly checking
+        # that we are allowed to join when we decide whether or not we
+        # need to do the invite/join dance.
+        yield self.federation_handler.do_invite_join(
+            remote_room_hosts,
+            room_id,
+            user.to_string(),
+            content,
+        )
+        yield user_joined_room(self.distributor, user, room_id)
+
+    @defer.inlineCallbacks
+    def _remote_leave(self, requester, remote_room_hosts, room_id, target):
+        fed_handler = self.federation_handler
+        try:
+            ret = yield fed_handler.do_remotely_reject_invite(
+                remote_room_hosts,
+                room_id,
+                target.to_string(),
+            )
+            defer.returnValue(ret)
+        except Exception as e:
+            # if we were unable to reject the exception, just mark
+            # it as rejected on our end and plough ahead.
+            #
+            # The 'except' clause is very broad, but we need to
+            # capture everything from DNS failures upwards
+            #
+            logger.warn("Failed to reject invite: %s", e)
+
+            yield self.store.locally_reject_invite(
+                target.to_string(), room_id
+            )
+            defer.returnValue({})
+
+    def get_or_register_3pid_guest(self, requester, medium, address, inviter_user_id):
+        rg = self.registration_handler
+        return rg.get_or_register_3pid_guest(medium, address, inviter_user_id)
+
+    @defer.inlineCallbacks
+    def forget(self, user, room_id):
+        user_id = user.to_string()
+
+        member = yield self.state_handler.get_current_state(
+            room_id=room_id,
+            event_type=EventTypes.Member,
+            state_key=user_id
+        )
+        membership = member.membership if member else None
+
+        if membership is not None and membership not in [
+            Membership.LEAVE, Membership.BAN
+        ]:
+            raise SynapseError(400, "User %s in room %s" % (
+                user_id, room_id
+            ))
+
+        if membership:
+            yield self.store.forget(user_id, room_id)
+
+
+class RoomMemberWorkerHandler(RoomMemberHandler):
+    @defer.inlineCallbacks
+    def _remote_join(self, requester, remote_room_hosts, room_id, user, content):
+        if len(remote_room_hosts) == 0:
+            raise SynapseError(404, "No known servers")
+
+        ret = yield remote_join(
+            self.http_client,
+            host=self.config.worker_replication_host,
+            port=self.config.worker_replication_http_port,
+            requester=requester,
+            remote_room_hosts=remote_room_hosts,
+            room_id=room_id,
+            user_id=user.to_string(),
+            content=content,
+        )
+        defer.returnValue(ret)
+
+        # FIXME:
+        yield user_joined_room(self.distributor, user, room_id)
+
+    def _remote_leave(self, requester, remote_room_hosts, room_id, target):
+        return remote_leave(
+            self.http_client,
+            host=self.config.worker_replication_host,
+            port=self.config.worker_replication_http_port,
+            requester=requester,
+            remote_room_hosts=remote_room_hosts,
+            room_id=room_id,
+            user_id=target.to_string(),
+        )
+        defer.returnValue(ret)
+
+    def get_or_register_3pid_guest(self, requester, medium, address, inviter_user_id):
+        # TODO: Hit out to master
+        return get_or_register_3pid_guest(
+            self.http_client,
+            host=self.config.worker_replication_host,
+            port=self.config.worker_replication_http_port,
+            requester=requester,
+            medium=medium,
+            address=address,
+            inviter_user_id=inviter_user_id,
+        )

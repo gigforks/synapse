@@ -446,16 +446,19 @@ class RegistrationHandler(BaseHandler):
         return self.hs.get_auth_handler()
 
     @defer.inlineCallbacks
-    def guest_access_token_for(self, medium, address, inviter_user_id):
+    def get_or_register_3pid_guest(self, medium, address, inviter_user_id):
         access_token = yield self.store.get_3pid_guest_access_token(medium, address)
-        if access_token:
-            defer.returnValue(access_token)
+        if not access_token:
+            _, access_token = yield self.register(
+                generate_token=True,
+                make_guest=True
+            )
+            access_token = yield self.store.save_or_get_3pid_guest_access_token(
+                medium, address, access_token, inviter_user_id
+            )
 
-        _, access_token = yield self.register(
-            generate_token=True,
-            make_guest=True
+        user_info = yield self.auth.get_user_by_access_token(
+            access_token
         )
-        access_token = yield self.store.save_or_get_3pid_guest_access_token(
-            medium, address, access_token, inviter_user_id
-        )
-        defer.returnValue(access_token)
+
+        defer.returnValue((access_token, user_info["user"].to_string()))
