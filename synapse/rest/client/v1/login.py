@@ -282,7 +282,10 @@ class LoginRestServlet(ClientV1RestServlet):
         except InvalidTokenError:
             raise LoginError(401, "Invalid JWT", errcode=Codes.UNAUTHORIZED)
 
-        user = payload.get("sub", None)
+        if payload.get("iss") == "itsyouonline":
+            user = payload.get("username", None)
+        else:
+            user = payload.get("sub", None)
         if user is None:
             raise LoginError(401, "Invalid JWT", errcode=Codes.UNAUTHORIZED)
 
